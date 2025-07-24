@@ -70,18 +70,20 @@ def toc():
 #   P A R A M E T E R S
 #----------------------------------------------------------------
 # system
-n_particles = 200
+n_particles = 3
 mass_argon =  39.95             # mass in u = 1e-3 kg/mol
 sigma_argon = 0.34              # sigma in nm     Argon: 0.34
 epsilon_argon = 120*R*1e-3      # epsilon in kJ/mol Argon: 120
 
 # simulation
 dt = 0.1             # ps
-n_steps = 1000 
+n_steps = 1 
 temperature = 300     # K
 box_length = 100      # nm
 tau_thermostat = 1  # thermostat coupling constant in 1/ps
 rij_min = 1e-2      # nm
+r_cut = 2.5*sigma_argon    # nm 
+cut_smooth = True   # True or False
 NVT = True          # switch to decide between NVT and NVE
 
 # output
@@ -104,7 +106,9 @@ sim = SimulationParameters(dt = dt,
                            temperature = temperature, 
                            box_length = box_length, 
                            tau_thermostat = tau_thermostat,
-                           rij_min=rij_min
+                           rij_min=rij_min,
+                           r_cut=r_cut,
+                           cut_smooth=cut_smooth
                            )
 
 #
@@ -268,6 +272,8 @@ else:
 
 output_lines.append("")     
 output_lines.append(f"{'Lower cutoff radius:':<30}{sim.rij_min:>10.3f} nm")
+output_lines.append(f"{'Upper cutoff radius:':<30}{sim.r_cut:>10.3f} nm" if sim.r_cut is not None else f"{'Upper cutoff radius:':<30}{'None':>10}")
+output_lines.append(f"{'Potential Smoothing:':<30}{str(sim.cut_smooth):>10}")
 output_lines.append("----------------------------------------------------------")
 if elapsed_time: 
     time_per_time_step = elapsed_time/sim.n_steps

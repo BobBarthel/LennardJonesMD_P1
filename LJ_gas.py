@@ -72,7 +72,7 @@ class ParticleSystem:
 
 
 class SimulationParameters:
-    def __init__(self, dt, n_steps, temperature, box_length, tau_thermostat = None, rij_min=0.0, ):
+    def __init__(self, dt, n_steps, temperature, box_length, tau_thermostat = None, rij_min=0.0, r_cut:float = None, cut_smooth:bool = True ):
         """
         Parameters:
             dt (float): Time step in ps.
@@ -91,6 +91,9 @@ class SimulationParameters:
         self.box_length = box_length  # in nm
         self.tau_thermostat = tau_thermostat  # thermostat coupling time in ps
         self.rij_min = rij_min        # minimum allowed pairwise distance
+        self.r_cut = r_cut              # r_cut initilize
+        self.cut_smooth = cut_smooth    # smooth off function when approaching r_cut to avoid discontinuity
+
 
         # Optional: friction coefficient for Langevin or stochastic thermostats
         self.xi = None
@@ -158,13 +161,15 @@ def potential_energy(ps: ParticleSystem, sim: SimulationParameters) -> float:
     sigma = ps.sigma[0]
     epsilon = ps.epsilon[0]
     L = sim.box_length
+    r_cut = sim.r_cut 
+    cut_smooth = sim.cut_smooth
         
     # vectorized code to calculate the pairwise distances
     # positions[:, np.newaxis, :] has shape (N, 1, 3)
     # positions[np.newaxis, :, :] has shape (1, N, 3)
     # The difference broadcasted has shape (N, N, 3)
     rij_matrix = ps.position[:, np.newaxis, :] - ps.position[np.newaxis, :, :]
-    
+
     # apply periodic boundary conditions
     rij_matrix -= L * np.rint(rij_matrix / L)
     
@@ -180,10 +185,25 @@ def potential_energy(ps: ParticleSystem, sim: SimulationParameters) -> float:
     # reset the very small distance to 0.00001 nm to make sure
     # that the sr6**2 term is numerically stable
     r = np.clip(r, sim.rij_min, None)
+
+    # Apply cutoff if r_cut is not None
+    if r_cut is not None:
+        cutoff_mask = r <= r_cut
+        r_cutoff = r[cutoff_mask]
+        lj_shift = 0
+        if cut_smooth:
+            sr6_cut = (sigma / r_cut) ** 6
+            lj_shift = 4 * epsilon * (sr6_cut ** 2 - sr6_cut)
+    else:
+        # No cutoff: include all pairs
+        r_cutoff = r
+        lj_shift = 0
+    
     
     # Compute Lennard-Jones potential for each unique pair
-    sr6 = (sigma / r)**6
+    sr6 = (sigma / r_cutoff)**6
     lj_pairwise = 4 * epsilon * (sr6**2 - sr6)
+    lj_pairwise -= lj_shift
 
     # Total potential energy
     E_pot = np.sum(lj_pairwise)
@@ -286,6 +306,7 @@ def calculate_force(ps: ParticleSystem, sim: SimulationParameters):
     sigma = ps.sigma[0]
     epsilon = ps.epsilon[0]
     L = sim.box_length
+    r_cut = sim.r_cut
 
 
     # vectorized code to calculate the pairwise distances
@@ -300,39 +321,49 @@ def calculate_force(ps: ParticleSystem, sim: SimulationParameters):
     # Pairwise distances (shape: N, N)
     r_matrix = np.linalg.norm(rij_matrix, axis=-1)  
 
-    # Extract upper triangle indices (i < j), i.e. the list of unique pairs
-    i_upper = np.triu_indices(n_particles, k=1)
+    # (i < j) triangle indices for unique pairs
+    i_upper, j_upper = np.triu_indices(n_particles, k=1)
     
     # Get list of unique distance vectors and unique distances
-    rij = rij_matrix[i_upper]                       # shape (N_pairs, 3)    
-    r = r_matrix[i_upper]                           # shape (N_pairs,)
+    rij = rij_matrix[i_upper, j_upper]                       # shape (N_pairs, 3)    
+    r = r_matrix[i_upper, j_upper]                           # shape (N_pairs,)
     
     # reset distances < rij_min  to rij_min to make sure
     # that the sr6**2 term is numerically stable
     r = np.clip(r, sim.rij_min, None)
-    
-    # Normalize rij to unit vectors and rescale to match clipped r
+
+     # Normalize rij to unit vectors and rescale to match clipped r
     rij = rij / np.linalg.norm(rij, axis=1)[:, np.newaxis]  # normalize each rij
     rij *= r[:, np.newaxis]                                 # rescale to clipped r
 
-    # Lennard-Jones force magnitude: dV/dr
-    sr6 = (sigma / r)**6                            # shape (N_pairs,)
-    dV_dr = 24 * epsilon / r * (-2 * sr6**2 + sr6)  # shape (N_pairs,)
+    # Apply cutoff if r_cut is not None
+    if r_cut is not None:
+        cutoff_mask = r <= r_cut
+    else:
+        cutoff_mask = np.ones_like(r, dtype=bool)
 
-    # Force vectors: shape (N_pairs, 3)
-    # dV_dr[:, np.newaxis] shapes it to (N_pairs, 1), i.e. 2D column vector
-    # broadcasting to rij with shape (N_pairs, 3) is then possible
-    f_ij = (dV_dr[:, np.newaxis] / r[:, np.newaxis]) * rij
+    # Filter pairs within cutoff
+    r_cutoff = r[cutoff_mask]              # Shape: (N_pairs_filtered,)
+    rij_cutoff = rij[cutoff_mask]          # Shape: (N_pairs_filtered, 3)
+    i_cutoff = i_upper[cutoff_mask]        # Shape: (N_pairs_filtered,)
+    j_cutoff = j_upper[cutoff_mask]        # Shape: (N_pairs_filtered,)
+
+    # Compute LJ force magnitude: dV/dr
+    sr6 = (sigma / r_cutoff) ** 6                           # Shape: (N_pairs_filtered,)
+    dV_dr = 24 * epsilon / r_cutoff * (-2 * sr6 ** 2 - sr6)  # Shape: (N_pairs_filtered,)
+
+    # Force vectors: F = (dV/dr / r) * rij
+    f_ij = (dV_dr[:, np.newaxis] / r_cutoff[:, np.newaxis]) * rij_cutoff  # Shape: (N_pairs_filtered, 3)
 
     # Initialize total force array
-    force = np.zeros_like(ps.position)  # shape (N, 3)
+    force = np.zeros_like(ps.position)  # Shape: (N, 3)
 
-    # Distribute pairwise forces to particle i and j
-    for idx, (i, j) in enumerate(zip(i_upper[0], i_upper[1])):
-        force[i] -= f_ij[idx]
-        force[j] += f_ij[idx]
+    # Distribute pairwise forces to particles i and j
+    for idx, (i, j) in enumerate(zip(i_cutoff, j_cutoff)):
+        force[i] -= f_ij[idx]  # Force on particle i
+        force[j] += f_ij[idx]  # Force on particle j (Newton's 3rd law)
 
-    # update the force vector in the ParticleSystem class
+    # Update the force vector in the ParticleSystem class
     ps.force = force
 
 def A_step(ps: ParticleSystem, sim: SimulationParameters, half_step=False):
