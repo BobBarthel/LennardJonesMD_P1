@@ -72,7 +72,7 @@ class ParticleSystem:
 
 
 class SimulationParameters:
-    def __init__(self, dt, n_steps, temperature, box_length, tau_thermostat = None, rij_min=0.0, r_cut:float = None, cut_smooth:bool = True ):
+    def __init__(self, dt, n_steps, temperature, box_length, tau_thermostat = None, rij_min=0.0, r_cut:float = None, cut_smooth:bool = True, neighbor_steps:int=None, neighbor_current:int=0, neighbor_list=None, seed=42):
         """
         Parameters:
             dt (float): Time step in ps.
@@ -93,12 +93,17 @@ class SimulationParameters:
         self.rij_min = rij_min        # minimum allowed pairwise distance
         self.r_cut = r_cut              # r_cut initilize
         self.cut_smooth = cut_smooth    # smooth off function when approaching r_cut to avoid discontinuity
+        self.neighbor_steps = neighbor_steps  # Number of steps between neighbor list updates
+        self.neighbor_current = neighbor_current  # Current step for neighbor list updates
+        self.neighbor_list = neighbor_list # Neighbor list for efficient force calculations (optional)
 
 
         # Optional: friction coefficient for Langevin or stochastic thermostats
         self.xi = None
         if self.tau_thermostat and self.tau_thermostat > 0.0: 
             self.xi = 1/self.tau_thermostat
+        
+        np.random.seed(seed) # setting a seed
 
 
 #----------------------------------------------------------------
@@ -141,7 +146,58 @@ def initialize_velocities(ps: ParticleSystem, temperature: float):
     v_cm = np.average(ps.velocity, axis=0, weights=ps.mass)
     ps.velocity -= v_cm
     
+#--------------------------------------
+# Bob and Arynas Fun-Zone
+#--------------------------------------
 
+def get_neighbors(ps: ParticleSystem, sim: SimulationParameters) -> None: 
+    """
+    Returns the neighbor list for the ParticleSystem based on the current simulation parameters.
+    If neighbor_steps is set, it updates the neighbor list every neighbor_steps steps.
+    If neighbor_steps is None, it updates the neighbor list every step.
+    """
+    if sim.neighbor_steps is not None:
+        if sim.neighbor_current % sim.neighbor_steps == 0:
+            sim.neighbor_current += 1
+            return update_neighbor_list(ps, sim)
+        else:
+            sim.neighbor_current += 1
+            return None
+    else:
+        sim.neighbor_current += 1
+        return update_neighbor_list(ps, sim)
+
+def update_neighbor_list(ps: ParticleSystem, sim: SimulationParameters) -> None:
+    n_particles = ps.n
+    L = sim.box_length
+    r_cut = sim.r_cut
+
+    rij_matrix = ps.position[:, np.newaxis, :] - ps.position[np.newaxis, :, :]
+
+    # apply periodic boundary conditions
+    rij_matrix -= L * np.rint(rij_matrix / L)
+    
+    # Pairwise distances (shape: N, N)
+    r_matrix = np.linalg.norm(rij_matrix, axis=-1)  
+
+    # Extract upper triangle indices (i < j), i.e. the list of unique pairs
+    i_upper, j_upper = np.triu_indices(n_particles, k=1)
+
+    # Filter pairs within r_cut
+    if r_cut is None or r_cut <= 0:
+        # If no cutoff is defined, consider all pairs
+        i_neighbors = i_upper
+        j_neighbors = j_upper
+    elif r_cut > 0:
+        neighbor_mask = r_matrix[i_upper, j_upper] <= r_cut
+        i_neighbors = i_upper[neighbor_mask]
+        j_neighbors = j_upper[neighbor_mask]
+
+    # Store neighbor list as list of (i, j) pairs or arrays
+    sim.neighbor_list = [i_neighbors, j_neighbors]
+
+    
+    
 #--------------------------------------
 # Energies
 #--------------------------------------
@@ -157,51 +213,39 @@ def potential_energy(ps: ParticleSystem, sim: SimulationParameters) -> float:
         Energy is in the same units as epsilon (kJ/mol).
         Positions must be in the same units as sigma (nm).
     """
-    n_particles = ps.n
     sigma = ps.sigma[0]
     epsilon = ps.epsilon[0]
     L = sim.box_length
     r_cut = sim.r_cut 
     cut_smooth = sim.cut_smooth
+
+    i_neighbors, j_neighbors = sim.neighbor_list
+
+    if len(i_neighbors) == 0:
+        return 0.0
         
-    # vectorized code to calculate the pairwise distances
-    # positions[:, np.newaxis, :] has shape (N, 1, 3)
-    # positions[np.newaxis, :, :] has shape (1, N, 3)
-    # The difference broadcasted has shape (N, N, 3)
-    rij_matrix = ps.position[:, np.newaxis, :] - ps.position[np.newaxis, :, :]
+    rij = ps.position[i_neighbors] - ps.position[j_neighbors]
 
     # apply periodic boundary conditions
-    rij_matrix -= L * np.rint(rij_matrix / L)
+    rij -= L * np.rint(rij / L)
     
-    # Pairwise distances (shape: N, N)
-    r_matrix = np.linalg.norm(rij_matrix, axis=-1)  
-
-    # Extract upper triangle indices (i < j), i.e. the list of unique pairs
-    i_upper = np.triu_indices(n_particles, k=1)
     
-    # Get list of unique distance vectors and unique distances
-    r = r_matrix[i_upper]                           # shape (N_pairs,)
+    r =  np.linalg.norm(rij, axis=-1)                       
 
-    # reset the very small distance to 0.00001 nm to make sure
-    # that the sr6**2 term is numerically stable
     r = np.clip(r, sim.rij_min, None)
 
-    # Apply cutoff if r_cut is not None
     if r_cut is not None:
-        cutoff_mask = r <= r_cut
-        r_cutoff = r[cutoff_mask]
         lj_shift = 0
         if cut_smooth:
             sr6_cut = (sigma / r_cut) ** 6
             lj_shift = 4 * epsilon * (sr6_cut ** 2 - sr6_cut)
     else:
-        # No cutoff: include all pairs
-        r_cutoff = r
+        # No cutoff: include all pairs in neighbor list
         lj_shift = 0
     
     
     # Compute Lennard-Jones potential for each unique pair
-    sr6 = (sigma / r_cutoff)**6
+    sr6 = (sigma / r)**6
     lj_pairwise = 4 * epsilon * (sr6**2 - sr6)
     lj_pairwise -= lj_shift
 
@@ -302,66 +346,51 @@ def calculate_force(ps: ParticleSystem, sim: SimulationParameters):
         - Returns no value; updates ps.force in-place (shape: (N, 3)).
     """
     
-    n_particles = ps.n
     sigma = ps.sigma[0]
     epsilon = ps.epsilon[0]
     L = sim.box_length
     r_cut = sim.r_cut
+    cut_smooth = sim.cut_smooth
 
+    i_neighbors, j_neighbors = sim.neighbor_list
 
-    # vectorized code to calculate the pairwise distances
-    # positions[:, np.newaxis, :] has shape (N, 1, 3)
-    # positions[np.newaxis, :, :] has shape (1, N, 3)
-    # The difference broadcasted has shape (N, N, 3)
-    rij_matrix = ps.position[:, np.newaxis, :] - ps.position[np.newaxis, :, :]
+    if len(i_neighbors) == 0:
+        ps.force[:] = 0.0
+        return
+
+    # Vectorized pairwise displacement
+    rij = ps.position[i_neighbors] - ps.position[j_neighbors]
     
     # apply periodic boundary conditions
-    rij_matrix -= L * np.rint(rij_matrix / L)
+    rij -= L * np.rint(rij / L)
     
-    # Pairwise distances (shape: N, N)
-    r_matrix = np.linalg.norm(rij_matrix, axis=-1)  
-
-    # (i < j) triangle indices for unique pairs
-    i_upper, j_upper = np.triu_indices(n_particles, k=1)
-    
-    # Get list of unique distance vectors and unique distances
-    rij = rij_matrix[i_upper, j_upper]                       # shape (N_pairs, 3)    
-    r = r_matrix[i_upper, j_upper]                           # shape (N_pairs,)
-    
-    # reset distances < rij_min  to rij_min to make sure
-    # that the sr6**2 term is numerically stable
+    # Pairwise distances
+    r = np.linalg.norm(rij, axis=-1)
     r = np.clip(r, sim.rij_min, None)
 
-     # Normalize rij to unit vectors and rescale to match clipped r
+    # Normalize rij to unit vectors and rescale to match clipped r
     rij = rij / np.linalg.norm(rij, axis=1)[:, np.newaxis]  # normalize each rij
     rij *= r[:, np.newaxis]                                 # rescale to clipped r
 
-    # Apply cutoff if r_cut is not None
-    if r_cut is not None:
-        cutoff_mask = r <= r_cut
-    else:
-        cutoff_mask = np.ones_like(r, dtype=bool)
-
-    # Filter pairs within cutoff
-    r_cutoff = r[cutoff_mask]              # Shape: (N_pairs_filtered,)
-    rij_cutoff = rij[cutoff_mask]          # Shape: (N_pairs_filtered, 3)
-    i_cutoff = i_upper[cutoff_mask]        # Shape: (N_pairs_filtered,)
-    j_cutoff = j_upper[cutoff_mask]        # Shape: (N_pairs_filtered,)
-
     # Compute LJ force magnitude: dV/dr
-    sr6 = (sigma / r_cutoff) ** 6                           # Shape: (N_pairs_filtered,)
-    dV_dr = 24 * epsilon / r_cutoff * (-2 * sr6 ** 2 - sr6)  # Shape: (N_pairs_filtered,)
+    sr6 = (sigma / r) ** 6                           # Shape: (N_pairs_filtered,)
+    dV_dr = 24 * epsilon / r * (-2 * sr6 ** 2 - sr6)  # Shape: (N_pairs_filtered,)
+
+    if r_cut is not None and cut_smooth:
+        sr6_cut = (sigma / r_cut) ** 6
+        dV_dr_shift = 24 * epsilon / r_cut * (-2 * sr6_cut ** 2 - sr6_cut)
+        # Subtract the force shift at r_cut from all forces
+        dV_dr -= dV_dr_shift
 
     # Force vectors: F = (dV/dr / r) * rij
-    f_ij = (dV_dr[:, np.newaxis] / r_cutoff[:, np.newaxis]) * rij_cutoff  # Shape: (N_pairs_filtered, 3)
+    f_ij = ((dV_dr / r)[:, np.newaxis]) * rij  # Shape: (N_pairs_filtered, 3)
 
     # Initialize total force array
     force = np.zeros_like(ps.position)  # Shape: (N, 3)
 
-    # Distribute pairwise forces to particles i and j
-    for idx, (i, j) in enumerate(zip(i_cutoff, j_cutoff)):
-        force[i] -= f_ij[idx]  # Force on particle i
-        force[j] += f_ij[idx]  # Force on particle j (Newton's 3rd law)
+    # Distribute pairwise forces to particles i and j (optimized w/ vectorized operations)
+    np.add.at(force, i_neighbors, -f_ij) # action
+    np.add.at(force, j_neighbors, +f_ij) # reaction
 
     # Update the force vector in the ParticleSystem class
     ps.force = force
